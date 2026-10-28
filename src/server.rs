@@ -9,6 +9,9 @@ use crate::utils::{
 };
 use crate::Args;
 
+#[path = "cscom.rs"]
+mod cscom;
+
 use anyhow::{anyhow, Result};
 use async_deflate_zip::{CompressionLevel, EntryOptions, ZipWriter};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -70,10 +73,16 @@ pub struct Server {
     html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
     running: Arc<AtomicBool>,
+    cscom: Option<cscom::CscomUpload>,
 }
 
 impl Server {
-    pub fn init(args: Args, running: Arc<AtomicBool>) -> Result<Self> {
+    pub fn init(mut args: Args, running: Arc<AtomicBool>) -> Result<Self> {
+        let cscom = cscom::CscomUpload::from_env()?;
+        if cscom.is_some() {
+            anyhow::ensure!(!args.path_is_file, "CSCOM uploads require a directory");
+            args.hidden.push(".cscom-upload-*".to_owned());
+        }
         let assets_prefix = format!("__dufs_v{}__/", env!("CARGO_PKG_VERSION"));
         let single_file_req_paths = if args.path_is_file {
             vec![
@@ -96,6 +105,7 @@ impl Server {
             None => Cow::Borrowed(INDEX_HTML),
         };
         Ok(Self {
+            cscom,
             args,
             running,
             single_file_req_paths,
@@ -157,6 +167,25 @@ impl Server {
                 return Ok(res);
             }
         };
+
+        if let Some(config) = &self.cscom {
+            if relative_path == "ping" && (method == Method::GET || method == Method::HEAD) {
+                return self.handle_cscom_health(method == Method::HEAD).await;
+            }
+            // Reserve staging names for every method, including direct GETs.
+            if relative_path
+                .split('/')
+                .any(|part| part.starts_with(".cscom-upload-"))
+            {
+                *res.status_mut() = StatusCode::NOT_FOUND;
+                return Ok(res);
+            }
+            if method == Method::POST
+                && (relative_path == "upload" || relative_path.starts_with("upload/"))
+            {
+                return self.handle_cscom_upload(req, &relative_path, config).await;
+            }
+        }
 
         if (method == Method::GET || method == Method::HEAD)
             && self
